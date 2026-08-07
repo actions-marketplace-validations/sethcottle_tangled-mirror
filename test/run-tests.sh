@@ -56,11 +56,11 @@ assert_ref() { # name, git-dir, ref, present|absent
 commit() { git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "$1"; }
 
 fresh_repo() {
-  rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"; cd "$WORKDIR"
+  rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"; cd "$WORKDIR" || exit 1
   git init -q --bare knot.git -b main
   git init -q --bare gh.git -b main
   git clone -q gh.git repo 2>/dev/null
-  cd repo
+  cd repo || exit 1
   commit one
   git push -q origin main
   git tag v1.0.0 && git push -q origin v1.0.0
@@ -79,11 +79,11 @@ defaults() {
 staging_count() { git for-each-ref refs/tangled-mirror-staging/ | wc -l | tr -d ' '; }
 
 echo "guards"
-fresh_repo; defaults; mkdir -p "$WORKDIR/plain"; cd "$WORKDIR/plain"
+fresh_repo; defaults; mkdir -p "$WORKDIR/plain"; cd "$WORKDIR/plain" || exit 1
 check "errors outside a git repo" "Run actions/checkout before this action" "$(run_action)"
 
-fresh_repo; defaults; cd "$WORKDIR"
-git clone -q --depth 1 "file://$WORKDIR/gh.git" shallow 2>/dev/null; cd shallow
+fresh_repo; defaults; cd "$WORKDIR" || exit 1
+git clone -q --depth 1 "file://$WORKDIR/gh.git" shallow 2>/dev/null; cd shallow || exit 1
 check "errors on a shallow clone" "Set 'fetch-depth: 0'" "$(run_action)"
 
 fresh_repo; defaults; TM_KEY=""
@@ -136,9 +136,11 @@ TM_BRANCHES="*"
 run_action >/dev/null
 assert_ref "mirrors branches that exist only on origin" "$WORKDIR/knot.git" refs/heads/feature-x present
 assert_ref "no refs/heads/HEAD artifact" "$WORKDIR/knot.git" refs/heads/HEAD absent
-[ "$(staging_count)" = "0" ] \
-  && { echo "  ok    staging refs cleaned up"; PASS=$((PASS+1)); } \
-  || { echo "  FAIL  staging refs left behind"; FAIL=$((FAIL+1)); }
+if [ "$(staging_count)" = "0" ]; then
+  echo "  ok    staging refs cleaned up"; PASS=$((PASS+1))
+else
+  echo "  FAIL  staging refs left behind"; FAIL=$((FAIL+1))
+fi
 
 fresh_repo; defaults; TM_BRANCHES="*"; TM_PRUNE="true"
 run_action >/dev/null
@@ -149,9 +151,11 @@ assert_ref "prune removes refs absent locally" "$WORKDIR/knot.git" refs/heads/st
 
 fresh_repo; defaults; TM_BRANCHES="*"; TEST_REMOTE="$WORKDIR/does-not-exist.git"
 run_action >/dev/null 2>&1
-[ "$(staging_count)" = "0" ] \
-  && { echo "  ok    staging cleaned up after a failed push"; PASS=$((PASS+1)); } \
-  || { echo "  FAIL  staging left behind after a failed push"; FAIL=$((FAIL+1)); }
+if [ "$(staging_count)" = "0" ]; then
+  echo "  ok    staging cleaned up after a failed push"; PASS=$((PASS+1))
+else
+  echo "  FAIL  staging left behind after a failed push"; FAIL=$((FAIL+1))
+fi
 
 echo
 echo "input validation and LFS"
@@ -170,9 +174,9 @@ check "allow-lfs overrides the refusal" "EXIT:0" "$(run_action)"
 
 echo
 echo "prune fallback guard"
-rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"; cd "$WORKDIR"
+rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"; cd "$WORKDIR" || exit 1
 git init -q --bare knot.git -b main
-git init -q standalone -b main; cd standalone
+git init -q standalone -b main; cd standalone || exit 1
 commit one
 defaults; TM_BRANCHES="*"; TM_PRUNE="true"
 check "refuses to prune without remote-tracking refs" "would delete every branch on the knot" "$(run_action)"
