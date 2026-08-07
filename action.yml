@@ -132,14 +132,19 @@ runs:
 
         # Every boolean is compared against the literal "true", so anything else
         # silently means false. That is fine for a typo on a destructive flag,
-        # but 'tags' defaults on, and an unset ${{ inputs.* }} expands to an
-        # empty string on workflow_run and schedule triggers. Left unchecked,
-        # wiring tags to a dispatch input would quietly stop mirroring tags on
-        # every automatic run. Refuse anything that isn't exactly true or false.
+        # but 'tags' defaults on, and an unset workflow input expands to an empty
+        # string on workflow_run and schedule triggers. Left unchecked, wiring
+        # tags to a dispatch input would quietly stop mirroring tags on every
+        # automatic run. Refuse anything that isn't exactly true or false.
+        #
+        # Nothing in this block may contain a GitHub expression delimiter, not
+        # even quoted or backslash-escaped inside a string. The Actions template
+        # engine parses the whole manifest before bash ever runs, so one in here
+        # stops the action from loading at all.
         require_boolean() { # name, value
           case "$2" in
             true|false) ;;
-            '') die "'$1' is empty. An unset \${{ inputs.* }} expands to an empty string on workflow_run and schedule triggers; pass an explicit true or false, for example \${{ inputs.$1 || false }}." ;;
+            '') die "'$1' is empty. An unset workflow input expands to an empty string on workflow_run and schedule triggers. Pass an explicit true or false, or fall back inside the expression with: inputs.$1 || false" ;;
             *)  die "'$1' must be true or false (got: '$2')." ;;
           esac
         }

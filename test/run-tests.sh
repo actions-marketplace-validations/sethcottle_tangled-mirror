@@ -18,6 +18,18 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 python3 "$REPO_ROOT/test/extract-script.py" > "$SCRIPT"
 bash -n "$SCRIPT" || { echo "action script is not valid bash"; exit 1; }
 
+# The Actions template engine parses the entire manifest before bash runs, so a
+# GitHub expression delimiter anywhere in the run block stops the action loading
+# at all, even inside a quoted string or backslash-escaped. Everything the script
+# needs arrives through the env: mapping, so there is never a reason for one to
+# be here. This check exists because the rest of the suite executes the extracted
+# script directly and would happily pass against a manifest that cannot load.
+if grep -n '\${{' "$SCRIPT"; then
+  echo "FATAL: the run block contains a GitHub expression delimiter (shown above)."
+  echo "       The manifest will fail to load. Pass values via env: instead."
+  exit 1
+fi
+
 sed 's|^REMOTE="git@\${TM_KNOT}:\${TM_REPO}"$|REMOTE="$TEST_REMOTE"|' "$SCRIPT" > "$TEST_SCRIPT"
 grep -q 'REMOTE="\$TEST_REMOTE"' "$TEST_SCRIPT" \
   || { echo "harness: REMOTE substitution failed. Did action.yml change?"; exit 1; }
