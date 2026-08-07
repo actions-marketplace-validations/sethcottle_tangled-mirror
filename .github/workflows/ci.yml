@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check action.yml parses
+        run: python3 -c "import yaml,sys; yaml.safe_load(open('action.yml'))"
+
+      - name: Extract the action's shell body
+        run: python3 test/extract-script.py > /tmp/action-script.sh
+
+      - name: Shellcheck
+        run: shellcheck --shell=bash --severity=style /tmp/action-script.sh
+
+      - name: Shellcheck the test harness
+        run: shellcheck --shell=bash --severity=warning test/run-tests.sh
+
+      - name: Actionlint
+        run: |
+          bash <(curl -sSf https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run the suite
+        run: bash test/run-tests.sh

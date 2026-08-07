@@ -1,0 +1,33 @@
+name: Mirror to Tangled
+
+# Automatic sync. Runs on every push to main and does the safe thing only:
+# no forcing, no pruning, no tag rewrites. Set the TANGLED_REPO repository
+# variable to switch it on; until then the job is skipped rather than failing.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tangled-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Push to knot
+    runs-on: ubuntu-latest
+    if: vars.TANGLED_REPO != ''
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: ./
+        with:
+          repo: ${{ vars.TANGLED_REPO }}
+          ssh-key: ${{ secrets.TANGLED_SSH_KEY }}
+          known-hosts: ${{ vars.TANGLED_KNOWN_HOSTS }}
+          on-divergence: warn

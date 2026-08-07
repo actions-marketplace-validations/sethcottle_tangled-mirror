@@ -1,0 +1,452 @@
+name: 'Tangled Mirror'
+description: 'Mirror a Git repository to a tangled.org knot over SSH, with verified host keys, explicit refspecs, and no surprise deletions.'
+author: 'Seth Cottle'
+
+branding:
+  icon: 'git-branch'
+  color: 'blue'
+
+inputs:
+  repo:
+    description: >-
+      Repository path on the knot, exactly as it appears after the colon in the
+      SSH remote. Accepts a handle path (alice.bsky.social/my-repo) or a DID
+      (did:plc:abc123/my-repo).
+    required: true
+  ssh-key:
+    description: >-
+      Private SSH key registered on the Tangled account that owns the repo.
+      Pass this from a secret. Never inline it.
+    required: true
+  knot:
+    description: 'Knot hostname.'
+    default: 'tangled.org'
+  port:
+    description: 'SSH port on the knot.'
+    default: '22'
+  known-hosts:
+    description: >-
+      Pinned SSH host key(s) for the knot, in known_hosts format. Strongly
+      recommended. When empty, the action falls back to ssh-keyscan, which
+      trusts whatever answers on first contact.
+    default: ''
+  skip-ci:
+    description: >-
+      Send the "skip-ci" push option, which tells Spindle not to run pipelines
+      for this push. Only relevant if the mirrored repository contains
+      .tangled/workflows, in which case every mirror push would otherwise
+      re-run CI that already ran on GitHub.
+    default: 'false'
+  address-family:
+    description: >-
+      Restrict SSH to one address family: auto, inet (IPv4) or inet6. Tangled's
+      own docs suggest AddressFamily inet in their example SSH config. The
+      default of auto is correct for tangled.org, which publishes no AAAA
+      record. Set it if a self-hosted knot has broken IPv6.
+    default: 'auto'
+  branches:
+    description: >-
+      Branches to push, space- or newline-separated. Use * for every local
+      branch. Defaults to the branch currently checked out.
+    default: ''
+  tags:
+    description: 'Push tags as well.'
+    default: 'true'
+  mirror:
+    description: >-
+      DESTRUCTIVE. Make the knot match this repository exactly: every branch,
+      deletions included, tags moved to wherever yours point, and any commit
+      that exists only on the knot discarded. Shorthand for branches "*" plus
+      prune, force and force-tags, and it overrides all four. Use it when the
+      Tangled side is a read-only copy and nothing is ever contributed there.
+    default: 'false'
+  prune:
+    description: >-
+      DESTRUCTIVE. Delete branches and tags on the knot that no longer exist
+      locally. Anything created on the Tangled side is deleted, including a
+      contributor's branch behind an open pull request. Requires branches: "*".
+      Never touches refs outside refs/heads and refs/tags.
+    default: 'false'
+  force:
+    description: >-
+      DESTRUCTIVE. Allow non-fast-forward updates. Commits that exist only on
+      the knot are discarded without warning. Leave this off unless GitHub is
+      the sole source of truth and you accept losing anything pushed to Tangled
+      directly.
+    default: 'false'
+  force-tags:
+    description: >-
+      DESTRUCTIVE for tags. Allow tags to move on the knot. Needed for rolling
+      tags such as "nightly" that CI re-points on every build; without it those
+      silently stay at whatever value the knot first received. A tag created on
+      the Tangled side and not present locally is overwritten.
+    default: 'false'
+  on-divergence:
+    description: >-
+      What to do when the knot holds refs you are not pushing, or refs pointing
+      at different commits: warn, fail, or ignore.
+    default: 'warn'
+  allow-lfs:
+    description: >-
+      Push a repository that uses Git LFS. Off by default because this action
+      pushes LFS pointer files but not the objects they reference, producing a
+      mirror that looks complete and is not.
+    default: 'false'
+  dry-run:
+    description: 'Report what would be pushed without pushing it.'
+    default: 'false'
+
+outputs:
+  pushed:
+    description: 'Space-separated list of refspecs that were pushed.'
+    value: ${{ steps.mirror.outputs.pushed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: mirror
+      shell: bash
+      env:
+        # Inputs are passed as env vars, never interpolated into the script
+        # body: ${{ }} substitution would write the key into the shell source.
+        TM_KEY: ${{ inputs.ssh-key }}
+        TM_REPO: ${{ inputs.repo }}
+        TM_KNOT: ${{ inputs.knot }}
+        TM_PORT: ${{ inputs.port }}
+        TM_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        TM_SKIP_CI: ${{ inputs.skip-ci }}
+        TM_ADDRESS_FAMILY: ${{ inputs.address-family }}
+        TM_BRANCHES: ${{ inputs.branches }}
+        TM_TAGS: ${{ inputs.tags }}
+        TM_MIRROR: ${{ inputs.mirror }}
+        TM_PRUNE: ${{ inputs.prune }}
+        TM_FORCE: ${{ inputs.force }}
+        TM_FORCE_TAGS: ${{ inputs.force-tags }}
+        TM_ON_DIVERGENCE: ${{ inputs.on-divergence }}
+        TM_ALLOW_LFS: ${{ inputs.allow-lfs }}
+        TM_DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        set -euo pipefail
+
+        die() { echo "::error::$*"; exit 1; }
+
+        # ---------- preflight ----------
+        git rev-parse --git-dir >/dev/null 2>&1 \
+          || die "No Git repository in $(pwd). Run actions/checkout before this action."
+
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          die "Shallow clone detected. Knots reject shallow pushes. Set 'fetch-depth: 0' on actions/checkout."
+        fi
+
+        [ -n "$TM_REPO" ] || die "'repo' is empty."
+        case "$TM_REPO" in
+          *' '*) die "'repo' must not contain spaces (got: $TM_REPO)." ;;
+        esac
+
+        # Tangled shows repo paths as "@handle/repo" in the web UI, but the SSH
+        # remote has no leading @. Copying from the browser is the obvious thing
+        # to do, so accept it rather than failing on a missing repo.
+        case "$TM_REPO" in
+          '@'*)
+            TM_REPO="${TM_REPO#@}"
+            echo "::notice::Dropped the leading '@' from 'repo'. The web UI shows @handle/repo, the SSH remote uses handle/repo."
+            ;;
+        esac
+
+        [ -n "$TM_KEY" ] || die "'ssh-key' is empty. Check the secret name. Note that secrets are not exposed to pull_request runs from forks."
+
+        # Expand the preset before anything reads these, so every guard and
+        # report below sees the settings actually in force.
+        if [ "$TM_MIRROR" = "true" ]; then
+          echo "::warning::'mirror' is on. The knot will be made to match this repository exactly: branches deleted, tags moved, and any commit that exists only on the knot discarded."
+          TM_BRANCHES="*"
+          TM_TAGS="true"
+          TM_PRUNE="true"
+          TM_FORCE="true"
+          TM_FORCE_TAGS="true"
+        fi
+
+        if [ "$TM_PRUNE" = "true" ] && [ "$TM_BRANCHES" != "*" ]; then
+          die "'prune: true' requires 'branches: \"*\"'. Pruning against an explicit branch list would delete every other branch on the knot."
+        fi
+
+        case "$TM_ON_DIVERGENCE" in
+          warn|fail|ignore) ;;
+          *) die "'on-divergence' must be warn, fail or ignore (got: $TM_ON_DIVERGENCE)." ;;
+        esac
+
+        # LFS pointers push fine; the objects they point at do not. The result
+        # looks like a complete mirror and isn't, so refuse rather than warn.
+        if [ "$TM_ALLOW_LFS" != "true" ] \
+           && git grep -q 'filter=lfs' HEAD -- '*.gitattributes' 2>/dev/null; then
+          die "This repository uses Git LFS. This action pushes pointer files but not LFS objects, so the mirror would be silently incomplete. Set 'allow-lfs: true' to push anyway, and mirror the objects separately."
+        fi
+
+        # ---------- ssh material and staging refs, removed on exit ----------
+        STAGING="refs/tangled-mirror-staging"
+        TM_TMP="$(mktemp -d)"
+
+        cleanup() {
+          rm -rf "${TM_TMP:-}"
+          git for-each-ref --format='%(refname)' "$STAGING/" 2>/dev/null \
+            | while IFS= read -r r; do git update-ref -d "$r" 2>/dev/null || true; done
+        }
+        trap cleanup EXIT INT TERM
+
+        KEY_FILE="$TM_TMP/id"
+        KH_FILE="$TM_TMP/known_hosts"
+
+        # Trailing newline is required by OpenSSH; a doubled one is harmless.
+        ( umask 077; printf '%s\n' "$TM_KEY" > "$KEY_FILE" )
+
+        if [ -n "$TM_KNOWN_HOSTS" ]; then
+          printf '%s\n' "$TM_KNOWN_HOSTS" > "$KH_FILE"
+
+          # On a non-default port OpenSSH looks the host up as "[host]:port" and
+          # will not match a plain "host" entry, so a key captured without -p
+          # would fail verification. Add the bracketed form alongside it.
+          if [ "$TM_PORT" != "22" ]; then
+            BRACKETED=0
+            KH_ORIG="$TM_TMP/known_hosts_given"
+            cp "$KH_FILE" "$KH_ORIG"
+            while IFS= read -r kh_line; do
+              [ -n "$kh_line" ] || continue
+              case "$kh_line" in
+                '#'*|'['*|'|'*) continue ;;   # comment, already bracketed, or hashed
+              esac
+              kh_host="${kh_line%% *}"
+              kh_rest="${kh_line#* }"
+              [ "$kh_host" != "$kh_line" ] || continue
+              case "$kh_host" in
+                *,*) continue ;;              # multi-host entry, leave as is
+              esac
+              printf '[%s]:%s %s\n' "$kh_host" "$TM_PORT" "$kh_rest" >> "$KH_FILE"
+              BRACKETED=$((BRACKETED + 1))
+            done < "$KH_ORIG"
+            if [ "$BRACKETED" -gt 0 ]; then
+              echo "::notice::Port $TM_PORT is not the default, so the pinned host key was also written in [host]:$TM_PORT form, which is what OpenSSH looks up."
+            fi
+          fi
+        else
+          echo "::warning::No 'known-hosts' pinned, so trusting whatever key $TM_KNOT returns on first contact. Pin it to make this push tamper-evident."
+          ssh-keyscan -p "$TM_PORT" -T 15 "$TM_KNOT" > "$KH_FILE" 2>/dev/null || true
+        fi
+        [ -s "$KH_FILE" ] || die "Could not obtain a host key for $TM_KNOT:$TM_PORT."
+
+        case "$TM_ADDRESS_FAMILY" in
+          auto)        AF_OPT="" ;;
+          inet|inet6)  AF_OPT="-o AddressFamily=$TM_ADDRESS_FAMILY" ;;
+          *) die "'address-family' must be auto, inet or inet6 (got: $TM_ADDRESS_FAMILY)." ;;
+        esac
+
+        # Scoped to this command only: nothing is written to ~/.ssh, so no
+        # later step in the job inherits this key or a relaxed host policy.
+        export GIT_SSH_COMMAND="ssh -i '$KEY_FILE' -o IdentitiesOnly=yes -o UserKnownHostsFile='$KH_FILE' -o StrictHostKeyChecking=yes -o PasswordAuthentication=no -o BatchMode=yes $AF_OPT -p '$TM_PORT'"
+
+        REMOTE="git@${TM_KNOT}:${TM_REPO}"
+
+        # ---------- build explicit refspecs ----------
+        # TARGETS records "<destination ref> <local sha>" for every ref this run
+        # intends to write, so the divergence report can compare like for like.
+        REFSPECS=()
+        REPORT=()
+        TARGETS=()
+        if [ "$TM_BRANCHES" = "*" ]; then
+          # Stage every branch under one namespace and push it with a glob
+          # refspec. A glob is what makes --prune able to see the whole branch
+          # namespace; enumerated refspecs give it nothing to scan. Staging also
+          # keeps refs/remotes/origin/HEAD from landing as a branch named HEAD.
+          COUNT=0
+          while IFS= read -r r; do
+            n="${r#refs/remotes/origin/}"
+            [ "$n" = "HEAD" ] && continue
+            sha="$(git rev-parse "$r")"
+            git update-ref "$STAGING/$n" "$sha"
+            REPORT+=("$n"); TARGETS+=("refs/heads/$n $sha"); COUNT=$((COUNT+1))
+          done < <(git for-each-ref --format='%(refname)' refs/remotes/origin/)
+
+          # No remote-tracking refs means this isn't a CI checkout. Falling back
+          # to local branches is fine on its own, but a CI checkout that somehow
+          # lands here has exactly one local branch, and pruning against that
+          # would delete every other branch on the knot. Refuse instead.
+          if [ "$COUNT" -eq 0 ]; then
+            if [ "$TM_PRUNE" = "true" ]; then
+              die "'prune: true' with 'branches: \"*\"' needs refs/remotes/origin/* to enumerate branches from, and none were found. Pruning against the local branches alone would delete every branch on the knot that this checkout does not happen to have. Fetch the branches first, or turn off prune."
+            fi
+            while IFS= read -r r; do
+              n="${r#refs/heads/}"
+              sha="$(git rev-parse "$r")"
+              git update-ref "$STAGING/$n" "$sha"
+              REPORT+=("$n"); TARGETS+=("refs/heads/$n $sha"); COUNT=$((COUNT+1))
+            done < <(git for-each-ref --format='%(refname)' refs/heads/)
+          fi
+          [ "$COUNT" -gt 0 ] || die "No branches found to push."
+          REFSPECS+=("$STAGING/*:refs/heads/*")
+        elif [ -n "$TM_BRANCHES" ]; then
+          # Unquoted on purpose: split on spaces and newlines alike.
+          # shellcheck disable=SC2086
+          for b in $TM_BRANCHES; do
+            git show-ref --verify --quiet "refs/heads/$b" \
+              || die "Branch '$b' does not exist locally. Fetch it first, or correct the 'branches' input."
+            REFSPECS+=("refs/heads/$b:refs/heads/$b")
+            REPORT+=("$b"); TARGETS+=("refs/heads/$b $(git rev-parse "refs/heads/$b")")
+          done
+        else
+          CURRENT="$(git symbolic-ref --quiet --short HEAD || true)"
+          [ -n "$CURRENT" ] \
+            || die "HEAD is detached and no 'branches' input was given. Set 'branches' explicitly."
+          REFSPECS+=("refs/heads/$CURRENT:refs/heads/$CURRENT")
+          REPORT+=("$CURRENT"); TARGETS+=("refs/heads/$CURRENT $(git rev-parse "refs/heads/$CURRENT")")
+        fi
+
+        if [ "$TM_TAGS" = "true" ]; then
+          # A leading '+' forces just this refspec, so rolling tags such as
+          # "nightly" can move without forcing branches too.
+          if [ "$TM_FORCE_TAGS" = "true" ]; then
+            REFSPECS+=("+refs/tags/*:refs/tags/*")
+            REPORT+=("(tags, forced)")
+          else
+            REFSPECS+=("refs/tags/*:refs/tags/*")
+            REPORT+=("(tags)")
+          fi
+          # Raw ref value, not the peeled commit: ls-remote reports the tag
+          # object for annotated tags, and the two must be compared like for like.
+          while IFS= read -r t; do
+            TARGETS+=("$t $(git rev-parse "$t")")
+          done < <(git for-each-ref --format='%(refname)' refs/tags/)
+        fi
+
+        # Expanding an empty array under `set -u` aborts on bash 3.2, which is
+        # what macOS runners still ship. The branches logic above always yields
+        # at least one refspec; this keeps that an explicit invariant.
+        [ ${#REFSPECS[@]} -gt 0 ] || die "Nothing to push."
+
+        # ---------- divergence report ----------
+        # A one-way mirror's real failure mode is going stale or overwriting
+        # without anyone noticing. Say plainly what the knot holds that this push
+        # does not account for, before deciding whether to write.
+        # The scan always runs: besides the report, it is what catches tags that
+        # would be rejected, and that guard applies even when reporting is off.
+        ONLY_ON_KNOT=(); AHEAD_ON_KNOT=(); TAG_MOVES=()
+        KNOT_LS="$TM_TMP/knot_refs"
+        if git ls-remote --heads --tags "$REMOTE" > "$KNOT_LS" 2>"$TM_TMP/ls_err"; then
+          while IFS=$'\t' read -r ksha kref; do
+            [ -n "${kref:-}" ] || continue
+            case "$kref" in *'^{}') continue ;; esac
+
+            LOCAL_SHA="$(printf '%s\n' ${TARGETS[@]+"${TARGETS[@]}"} \
+              | awk -v r="$kref" '$1==r {print $2; exit}')"
+
+            if [ -z "$LOCAL_SHA" ]; then
+              ONLY_ON_KNOT+=("$kref")
+            elif [ "$LOCAL_SHA" != "$ksha" ]; then
+              # Any existing tag pointing elsewhere needs a forced update,
+              # whether or not it moved forward.
+              case "$kref" in
+                refs/tags/*) TAG_MOVES+=("${kref#refs/tags/}") ;;
+              esac
+              # If the knot's commit is already in our history we are simply
+              # ahead, which is the normal case and not worth reporting.
+              KCOMMIT="$(git rev-parse --quiet --verify "${ksha}^{commit}" 2>/dev/null || true)"
+              LCOMMIT="$(git rev-parse --quiet --verify "${LOCAL_SHA}^{commit}" 2>/dev/null || true)"
+              if [ -n "$KCOMMIT" ] && [ -n "$LCOMMIT" ] \
+                 && git merge-base --is-ancestor "$KCOMMIT" "$LCOMMIT" 2>/dev/null; then
+                :
+              else
+                AHEAD_ON_KNOT+=("$kref (knot ${ksha:0:8}, here ${LOCAL_SHA:0:8})")
+              fi
+            fi
+          done < "$KNOT_LS"
+        else
+          echo "::warning::Could not list refs on the knot for the divergence check: $(head -1 "$TM_TMP/ls_err" 2>/dev/null)"
+        fi
+
+        # Git will not move an existing tag without force, and because this push
+        # is atomic that single rejection takes the branches down with it. Say so
+        # here rather than letting it surface as "atomic push failed".
+        if [ ${#TAG_MOVES[@]} -gt 0 ] && [ "$TM_TAGS" = "true" ] && [ "$TM_FORCE_TAGS" != "true" ]; then
+          die "These tags point at something else on the knot: ${TAG_MOVES[*]}. Git will not move an existing tag without force, and this push is atomic, so the whole run would be rejected. Set 'force-tags: true' if these are rolling tags such as 'nightly', or realign them locally. Note that forcing overwrites whatever the knot currently has for them."
+        fi
+
+        if [ "$TM_ON_DIVERGENCE" = "ignore" ]; then
+          ONLY_ON_KNOT=(); AHEAD_ON_KNOT=()
+        fi
+
+        DIVERGED_COUNT=$(( ${#ONLY_ON_KNOT[@]} + ${#AHEAD_ON_KNOT[@]} ))
+        if [ "$DIVERGED_COUNT" -gt 0 ]; then
+          {
+            echo "The knot holds refs this push does not account for:"
+            for r in ${ONLY_ON_KNOT[@]+"${ONLY_ON_KNOT[@]}"}; do
+              echo "  only on the knot: $r"
+            done
+            for r in ${AHEAD_ON_KNOT[@]+"${AHEAD_ON_KNOT[@]}"}; do
+              echo "  differs: $r"
+            done
+          } >&2
+
+          if [ ${#ONLY_ON_KNOT[@]} -gt 0 ] && [ "$TM_PRUNE" = "true" ]; then
+            echo "::warning::'prune' is on, so the refs listed as 'only on the knot' will be DELETED."
+          fi
+          if [ ${#AHEAD_ON_KNOT[@]} -gt 0 ] && [ "$TM_FORCE" = "true" ]; then
+            echo "::warning::'force' is on, so commits reachable only from the differing refs above will be DISCARDED."
+          fi
+
+          if [ "$TM_ON_DIVERGENCE" = "fail" ]; then
+            die "Knot has diverged and 'on-divergence: fail' is set. Inspect with: git fetch $REMOTE '+refs/heads/*:refs/tangled/*'"
+          fi
+        fi
+
+        # ---------- push ----------
+        ARGS=(push --atomic)
+        [ "$TM_FORCE" = "true" ]   && ARGS+=(--force)
+        [ "$TM_PRUNE" = "true" ]   && ARGS+=(--prune)
+        [ "$TM_DRY_RUN" = "true" ] && ARGS+=(--dry-run)
+        # Knots reject push options on a dry run, which sends no pack: the
+        # failure reads "malformed pack stream" and looks unrelated. A dry run
+        # cannot start a pipeline anyway, so drop the option instead.
+        if [ "$TM_SKIP_CI" = "true" ]; then
+          if [ "$TM_DRY_RUN" = "true" ]; then
+            echo "::notice::'skip-ci' is ignored during a dry run, which starts no pipelines and which knots reject push options on."
+          else
+            ARGS+=(--push-option=skip-ci)
+          fi
+        fi
+        ARGS+=("$REMOTE" "${REFSPECS[@]}")
+
+        echo "Pushing to ${TM_KNOT}:${TM_REPO}"
+        printf '  %s\n' "${REPORT[@]}"
+
+        if ! OUTPUT="$(git "${ARGS[@]}" 2>&1)"; then
+          echo "$OUTPUT"
+          case "$OUTPUT" in
+            *"doesn't match any key published"*|*"no key published"*)
+              die "The knot rejected this key. Add its PUBLIC half at https://${TM_KNOT}/settings/keys on the account that owns '${TM_REPO}'." ;;
+            *"shallow update not allowed"*)
+              die "Knot rejected a shallow push. Set 'fetch-depth: 0' on actions/checkout." ;;
+            *"does not support push options"*|*"push-options"*)
+              die "The knot does not accept push options, so 'skip-ci' cannot be sent. Set 'skip-ci: false'." ;;
+            *"non-fast-forward"*|*"fetch first"*)
+              die "The knot has commits that are not in this history, so the push was refused. Look at them before deciding: git fetch $REMOTE '+refs/heads/*:refs/tangled/*' && git log HEAD..refs/tangled/<branch>. Setting 'force: true' would discard them permanently. On Tangled that can include a contributor's branch behind an open pull request." ;;
+            *)
+              die "Push to ${TM_KNOT} failed." ;;
+          esac
+        fi
+        echo "$OUTPUT"
+
+        echo "pushed=${REPORT[*]}" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### Mirrored to \`${TM_KNOT}\`"
+          echo
+          echo "**Repo:** \`${TM_REPO}\`"
+          if [ "$TM_DRY_RUN" = "true" ]; then
+            echo "**Mode:** dry run, nothing was pushed"
+          fi
+          if [ "$TM_PRUNE" = "true" ]; then
+            echo "**Prune:** on, refs absent locally were removed from the knot"
+          fi
+          echo
+          echo '```'
+          printf '%s\n' "${REPORT[@]}"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"

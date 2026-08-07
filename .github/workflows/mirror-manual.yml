@@ -1,0 +1,68 @@
+name: Mirror to Tangled (manual)
+
+# Manual sync with a form in the Actions tab. This is where the destructive
+# options live, so they are a deliberate click each time instead of committed
+# config that can fire on its own. Dry run is on by default: look first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only, push nothing'
+        type: boolean
+        default: true
+      branches:
+        description: 'Branches to push (space separated). Blank = current branch. * = all. Required for prune.'
+        type: string
+        default: ''
+      on_divergence:
+        description: 'When the knot holds refs this push does not account for'
+        type: choice
+        options: [warn, fail, ignore]
+        default: warn
+      force_tags:
+        description: 'Let tags move on the knot (needed for rolling tags such as nightly)'
+        type: boolean
+        default: false
+      prune:
+        description: 'Delete branches and tags absent locally. Requires branches = *'
+        type: boolean
+        default: false
+      force:
+        description: 'Discard commits that exist only on the knot. Cannot be undone.'
+        type: boolean
+        default: false
+      mirror:
+        description: 'Make the knot an exact replica. Overrides the four options above.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tangled-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Push to knot
+    runs-on: ubuntu-latest
+    if: vars.TANGLED_REPO != ''
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: ./
+        with:
+          repo: ${{ vars.TANGLED_REPO }}
+          ssh-key: ${{ secrets.TANGLED_SSH_KEY }}
+          known-hosts: ${{ vars.TANGLED_KNOWN_HOSTS }}
+          branches: ${{ inputs.branches }}
+          on-divergence: ${{ inputs.on_divergence }}
+          force-tags: ${{ inputs.force_tags }}
+          prune: ${{ inputs.prune }}
+          force: ${{ inputs.force }}
+          mirror: ${{ inputs.mirror }}
+          dry-run: ${{ inputs.dry_run }}
