@@ -378,6 +378,42 @@ on:
     branches: main
 ```
 
+**A repo whose release workflow moves tags.** If your release job re-points a
+rolling tag, mirroring on `push` races it: the mirror checks out before the tag
+moves, so the knot keeps the previous value until something else gets pushed.
+Trigger after the release workflow finishes instead:
+
+```yaml
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: sethcottle/tangled-mirror@v1
+        with:
+          repo: seth.bsky.social/my-repo
+          ssh-key: ${{ secrets.TANGLED_SSH_KEY }}
+          known-hosts: ${{ vars.TANGLED_KNOWN_HOSTS }}
+          branches: main
+          force-tags: true
+```
+
+Careful wiring any input to `${{ inputs.something }}` in a workflow like this.
+On a `workflow_run` trigger there are no dispatch inputs, so those expand to an
+empty string. Write `${{ inputs.dry_run || false }}` instead. The action rejects
+empty and non-boolean values rather than guessing, so you'll get a clear error
+rather than silently different behaviour.
+
 **Self-hosted knot on a different port:**
 
 ```yaml
@@ -466,6 +502,13 @@ git fetch <remote> '+refs/heads/*:refs/tangled/*' && git log HEAD..refs/tangled/
 ```
 
 Then either merge it into GitHub or set `force: true` to discard it permanently.
+
+**`'tags' is empty`, or `must be true or false`**
+
+Boolean inputs have to be exactly `true` or `false`. `yes`, `1`, and `True` are
+all rejected. An empty value usually means you wired an input to
+`${{ inputs.something }}` in a workflow that also triggers on `workflow_run` or
+`schedule`, where dispatch inputs don't exist. Use `${{ inputs.something || false }}`.
 
 **Nothing pushed, no error**
 

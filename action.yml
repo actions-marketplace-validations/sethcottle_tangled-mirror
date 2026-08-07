@@ -3,8 +3,8 @@ description: 'Mirror a Git repository to a tangled.org knot over SSH, with verif
 author: 'Seth Cottle'
 
 branding:
-  icon: 'git-branch'
-  color: 'blue'
+  icon: 'copy'
+  color: 'green'
 
 inputs:
   repo:
@@ -129,6 +129,29 @@ runs:
         set -euo pipefail
 
         die() { echo "::error::$*"; exit 1; }
+
+        # Every boolean is compared against the literal "true", so anything else
+        # silently means false. That is fine for a typo on a destructive flag,
+        # but 'tags' defaults on, and an unset ${{ inputs.* }} expands to an
+        # empty string on workflow_run and schedule triggers. Left unchecked,
+        # wiring tags to a dispatch input would quietly stop mirroring tags on
+        # every automatic run. Refuse anything that isn't exactly true or false.
+        require_boolean() { # name, value
+          case "$2" in
+            true|false) ;;
+            '') die "'$1' is empty. An unset \${{ inputs.* }} expands to an empty string on workflow_run and schedule triggers; pass an explicit true or false, for example \${{ inputs.$1 || false }}." ;;
+            *)  die "'$1' must be true or false (got: '$2')." ;;
+          esac
+        }
+
+        require_boolean tags "$TM_TAGS"
+        require_boolean mirror "$TM_MIRROR"
+        require_boolean prune "$TM_PRUNE"
+        require_boolean force "$TM_FORCE"
+        require_boolean force-tags "$TM_FORCE_TAGS"
+        require_boolean allow-lfs "$TM_ALLOW_LFS"
+        require_boolean skip-ci "$TM_SKIP_CI"
+        require_boolean dry-run "$TM_DRY_RUN"
 
         # ---------- preflight ----------
         git rev-parse --git-dir >/dev/null 2>&1 \

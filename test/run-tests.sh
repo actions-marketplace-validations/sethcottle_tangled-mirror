@@ -307,6 +307,28 @@ fresh_repo; defaults; TM_MIRROR="true"; TM_BRANCHES="main"; TM_PRUNE="false"
 check "mirror overrides conflicting individual flags" "EXIT:0" "$(run_action)"
 
 echo
+echo "boolean inputs"
+# 'tags' defaults on, so a value that isn't exactly "true" silently disables it.
+# An unset ${{ inputs.* }} is an empty string on workflow_run triggers, which
+# makes this a realistic way to lose tags without noticing.
+fresh_repo; defaults; TM_TAGS=""
+check "empty boolean is refused" "'tags' is empty" "$(run_action)"
+check "empty boolean explains the workflow_run cause" "workflow_run" "$(run_action)"
+
+for bad in yes True 1 off; do
+  fresh_repo; defaults; TM_TAGS="$bad"
+  check "tags='$bad' is refused" "must be true or false" "$(run_action)"
+done
+
+fresh_repo; defaults; TM_PRUNE="yes"
+check "a bad destructive flag is refused too" "'prune' must be true or false" "$(run_action)"
+
+fresh_repo; defaults; TM_TAGS="false"
+OUT="$(run_action)"
+check "an explicit false is still accepted" "EXIT:0" "$OUT"
+assert_ref "tags=false really skips tags" "$WORKDIR/knot.git" refs/tags/v1.0.0 absent
+
+echo
 echo "tangled protocol options"
 fresh_repo; defaults; TM_ADDRESS_FAMILY="bogus"
 check "rejects an unknown address-family" "must be auto, inet or inet6" "$(run_action)"
