@@ -15,6 +15,7 @@ name: Mirror to Tangled
 on:
   push:
     branches: [main]
+    tags: ['v*']        # a branch push does not fire on tag pushes
   workflow_dispatch:
 
 permissions:
@@ -26,7 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0          # required, knots reject shallow pushes
+          ref: main             # tag pushes would land on a detached HEAD
+          fetch-depth: 0        # required, knots reject shallow pushes
 
       - uses: sethcottle/tangled-mirror@v1
         with:
@@ -112,6 +114,17 @@ ssh-keyscan -t ed25519 -p 2222 knot.example.com
 Copy the Quick start block above into `.github/workflows/mirror.yml` and fill in
 your `repo` value. Adding `dry-run: true` for the first run will show you what
 would be pushed without pushing it.
+
+Two details in that block are easy to miss. A `branches:` push trigger doesn't
+fire when you push a tag, so without the `tags:` line a release wouldn't reach
+the knot until your next commit. And `ref: main` matters because a tag push
+otherwise checks out a detached HEAD, which the action refuses rather than
+guessing which branch you meant.
+
+If you move a tag rather than only adding new ones, for example a floating `v1`
+or a rolling `nightly`, you also need `force-tags: true`. Git will not move an
+existing tag without it, and because the push is atomic that one rejection takes
+your branches down with it.
 
 ## Automatic and manual runs
 

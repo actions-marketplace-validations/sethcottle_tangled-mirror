@@ -1,12 +1,17 @@
 name: Mirror to Tangled
 
-# Automatic sync. Runs on every push to main and does the safe thing only:
-# no forcing, no pruning, no tag rewrites. Set the TANGLED_REPO repository
-# variable to switch it on; until then the job is skipped rather than failing.
+# Automatic sync. Set the TANGLED_REPO repository variable to switch it on;
+# until then the job is skipped rather than failing.
+#
+# Tags need their own trigger. A branch push does not fire on tag pushes, so
+# tagging a release would not reach the knot until the next commit landed on
+# main. This repo also moves a floating `v1` tag on every release, which git
+# will not update without force.
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
 
 permissions:
   contents: read
@@ -23,6 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # Always mirror main, even when a tag push triggered the run, which
+          # would otherwise leave the checkout on a detached HEAD.
+          ref: main
           fetch-depth: 0
 
       - uses: ./
@@ -30,4 +38,8 @@ jobs:
           repo: ${{ vars.TANGLED_REPO }}
           ssh-key: ${{ secrets.TANGLED_SSH_KEY }}
           known-hosts: ${{ vars.TANGLED_KNOWN_HOSTS }}
+          branches: main
+          # The floating `v1` tag moves on every release, and git will not move
+          # an existing tag without this. GitHub is the source of truth here.
+          force-tags: true
           on-divergence: warn
